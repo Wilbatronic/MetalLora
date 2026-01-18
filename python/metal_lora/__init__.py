@@ -25,7 +25,18 @@ from .utils import (
     count_lora_parameters,
 )
 
+# Advanced Apple Silicon optimizations
+from .advanced_ops import (
+    FP16LoRALinear,
+    QLoRALinear,
+    StreamingLoRALinear,
+    MultiAdapterLoRA,
+    quantize_nf4,
+    dequantize_nf4,
+)
+
 __all__ = [
+    # Core
     "LoRALinear",
     "LoRAEmbedding",
     "lora_forward",
@@ -35,4 +46,11 @@ __all__ = [
     "load_adapter",
     "apply_lora_to_model",
     "count_lora_parameters",
+    # Advanced
+    "FP16LoRALinear",
+    "QLoRALinear",
+    "StreamingLoRALinear", 
+    "MultiAdapterLoRA",
+    "quantize_nf4",
+    "dequantize_nf4",
 ]
