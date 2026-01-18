@@ -5,9 +5,9 @@ This package provides heavily optimized Metal kernels for LoRA (Low-Rank Adaptat
 training and inference on Apple Silicon, integrated with the MLX framework.
 
 Example:
-    >>> from metal_lora import LoRALinear
-    >>> layer = LoRALinear(4096, 4096, rank=16)
-    >>> output = layer(input_tensor)
+    >>> from metal_lora import LoRATrainer, TrainingConfig
+    >>> trainer = LoRATrainer(model, config=TrainingConfig(rank=16))
+    >>> trainer.train(train_data, num_epochs=3)
 """
 
 __version__ = "0.1.0"
@@ -47,6 +47,15 @@ from .extreme_ops import (
     FusedLoRABlock,
 )
 
+# Training package
+from .trainer import (
+    LoRATrainer,
+    TrainingConfig,
+    TrainingState,
+    train_lora,
+    quick_finetune,
+)
+
 __all__ = [
     # Core
     "LoRALinear",
@@ -74,4 +83,10 @@ __all__ = [
     "SpeculativeLoRADecoder",
     "FusedLoRAAdamW",
     "FusedLoRABlock",
+    # Training
+    "LoRATrainer",
+    "TrainingConfig",
+    "TrainingState",
+    "train_lora",
+    "quick_finetune",
 ]
