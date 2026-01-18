@@ -16,6 +16,11 @@ from .optimizations import (
     MixedPrecisionConfig, MixedPrecisionTrainer,
     FusedGradAccumulator,
 )
+from .exceptions import (
+    MetalLoRAError, ConfigurationError, ShapeError, DeviceError, AdapterError,
+    validate_rank, validate_alpha, validate_probability,
+)
+from .logging import logger, get_logger, set_log_level, enable_debug, disable_logging
 
 __all__ = [
     # Core
@@ -27,10 +32,11 @@ __all__ = [
     # Optimizations
     "compress_weights", "decompress_weights", "save_compressed", "load_compressed",
     "MemoryPool", "get_memory_pool",
-    "MultiAdapterManager",
-    "SpeculativeDecoder",
-    "LoRAKVCache",
-    "LazyLoRA",
-    "MixedPrecisionConfig", "MixedPrecisionTrainer",
-    "FusedGradAccumulator",
+    "MultiAdapterManager", "SpeculativeDecoder", "LoRAKVCache", "LazyLoRA",
+    "MixedPrecisionConfig", "MixedPrecisionTrainer", "FusedGradAccumulator",
+    # Exceptions
+    "MetalLoRAError", "ConfigurationError", "ShapeError", "DeviceError", "AdapterError",
+    "validate_rank", "validate_alpha", "validate_probability",
+    # Logging
+    "logger", "get_logger", "set_log_level", "enable_debug", "disable_logging",
 ]

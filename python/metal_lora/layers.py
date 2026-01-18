@@ -2,18 +2,42 @@
 
 import mlx.core as mx
 import mlx.nn as nn
-from typing import Optional
+from typing import Optional, Dict
 import math
 
 from .ops import lora_forward, lora_backward_efficient, merge_lora_weights
+from .exceptions import validate_rank, validate_alpha, validate_probability, ConfigurationError
+from .logging import logger
 
 
 class LoRALinear(nn.Module):
     """Linear layer with LoRA adaptation.
-    
+
     h = W0 @ x + (alpha/rank) * B @ A @ x
+
+    Parameters
+    ----------
+    in_features : int
+        Input dimension.
+    out_features : int
+        Output dimension.
+    rank : int
+        LoRA rank (1-256).
+    alpha : float
+        Scaling factor.
+    dropout : float
+        Dropout probability (0-1).
+    use_bias : bool
+        Include bias term.
+    freeze_base : bool
+        Freeze base weights.
+
+    Raises
+    ------
+    ConfigurationError
+        If parameters are invalid.
     """
-    
+
     def __init__(
         self,
         in_features: int,
@@ -25,24 +49,35 @@ class LoRALinear(nn.Module):
         freeze_base: bool = True,
     ):
         super().__init__()
-        
+
+        # Validation
+        if in_features <= 0:
+            raise ConfigurationError(f"in_features must be positive, got {in_features}")
+        if out_features <= 0:
+            raise ConfigurationError(f"out_features must be positive, got {out_features}")
+        validate_rank(rank)
+        validate_alpha(alpha)
+        validate_probability(dropout, "dropout")
+
         self.in_features = in_features
         self.out_features = out_features
         self.rank = rank
         self.alpha = alpha
         self.dropout = dropout
         self.freeze_base = freeze_base
-        
+
         self.W0 = mx.zeros((out_features, in_features))
-        
+
         bound = 1.0 / math.sqrt(in_features)
         self.A = mx.random.uniform(-bound, bound, (rank, in_features))
         self.B = mx.zeros((out_features, rank))
-        
+
         self.bias = mx.zeros((out_features,)) if use_bias else None
-        
+
         if freeze_base:
             self.W0 = mx.stop_gradient(self.W0)
+
+        logger.debug(f"LoRALinear: {in_features}→{out_features}, rank={rank}")
     
     def __call__(self, x: mx.array) -> mx.array:
         original_shape = x.shape
