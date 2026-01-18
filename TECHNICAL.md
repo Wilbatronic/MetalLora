@@ -1,122 +1,131 @@
-# MetalLoRA Technical Overview
+# MetalLoRA: Hardware-Optimized LoRA for Apple Silicon
 
-## Problem
+## Abstract
 
-LoRA fine-tuning on Apple Silicon is bottlenecked by:
-1. Kernel dispatch overhead (each op = new dispatch)
-2. Memory bandwidth (moving data between CPU/GPU)
-3. Suboptimal use of hardware matrix units
+MetalLoRA is a high-performance implementation of Low-Rank Adaptation (LoRA) for Apple Silicon, leveraging Metal's GPU compute capabilities. This document describes the key architectural decisions and optimization techniques that enable significant performance improvements over naive implementations.
 
-## Solution
+## 1. Motivation
 
-MetalLoRA fuses operations and exploits Apple Silicon architecture:
+Standard LoRA implementations on Apple Silicon suffer from three primary bottlenecks:
 
-### 1. Operation Fusion
+| Bottleneck             | Cause                                | Impact                 |
+| ---------------------- | ------------------------------------ | ---------------------- |
+| Dispatch overhead      | Separate kernel launch per operation | 10-50μs per dispatch   |
+| Memory bandwidth       | Redundant data movement              | Limited by 400GB/s UMA |
+| Underutilized hardware | Scalar ALU operations                | <10% of peak FLOPS     |
 
-Standard MLX:
+MetalLoRA addresses these through operation fusion, hardware-specific optimizations, and memory-aware scheduling.
+
+## 2. Core Optimizations
+
+### 2.1 Operation Fusion
+
+The LoRA forward pass computes:
+
 ```
-Ax = A @ x          # dispatch 1
-BAx = B @ Ax        # dispatch 2
-W0x = W0 @ x        # dispatch 3
-out = W0x + BAx     # dispatch 4
+h = W₀x + (α/r) · B(Ax)
 ```
 
-MetalLoRA:
-```
-out = fused_lora(x, W0, A, B)  # single dispatch
-```
+A naive implementation requires four separate dispatches. MetalLoRA fuses these into a single kernel, eliminating dispatch overhead and enabling data reuse across operations.
 
-**Benefit:** 3-4x fewer dispatches, data stays in registers.
+### 2.2 simdgroup_matrix Acceleration
 
-### 2. simdgroup_matrix (Hardware 8x8 FMA)
-
-Apple GPUs have dedicated matrix units that compute 8×8 matrix multiplies in a single instruction. We use `simdgroup_matrix<float, 8, 8>` for:
-- 16x throughput vs scalar operations
-- Direct hardware utilization (same as Apple's MPS)
+Apple Silicon GPUs contain dedicated matrix units accessed via the `simdgroup_matrix` API. These units compute 8×8 matrix multiplications in a single cycle, providing up to 16× throughput compared to scalar operations.
 
 ```metal
 simdgroup_matrix<float, 8, 8> acc;
 simdgroup_multiply_accumulate(acc, W_tile, x_tile, acc);
 ```
 
-### 3. Tile Memory Persistence
+### 2.3 TBDR-Aware Memory Access
 
-Apple's TBDR (Tile-Based Deferred Rendering) architecture keeps data in fast on-chip tile memory. We structure kernels to:
-- Load data once into threadgroup memory
-- Perform all operations (A@x, B@Ax, W0@x) without eviction
-- Write final result to device memory
+Apple GPUs use Tile-Based Deferred Rendering (TBDR), which maintains fast on-chip tile memory. MetalLoRA structures computation to:
 
-**Benefit:** ~3x bandwidth reduction.
+1. Load input data into threadgroup memory once
+2. Perform all intermediate computations without eviction
+3. Write final results to device memory
 
-### 4. Mixed Precision (FP16 + FP32)
+This reduces effective memory bandwidth requirements by approximately 3×.
 
-```metal
-device const half* x;        // FP16 storage (2x bandwidth)
-float acc = 0.0f;            // FP32 accumulation (precision)
-output[i] = half(acc);       // FP16 output
+### 2.4 Mixed Precision Computation
+
+MetalLoRA uses FP16 for storage and memory operations, with FP32 accumulators for numerical stability:
+
+- **Storage**: FP16 (2× memory bandwidth efficiency)
+- **Accumulation**: FP32 (maintains precision)
+- **Output**: FP16 (reduced memory footprint)
+
+### 2.5 Quantized Inference (QLoRA)
+
+For memory-constrained deployments, MetalLoRA supports 4-bit quantized base weights using the NF4 (Normal Float 4) format from the QLoRA paper. This provides:
+
+- 75% reduction in base weight memory
+- On-the-fly dequantization with minimal overhead
+- Full precision LoRA adapters preserved
+
+## 3. Advanced Features
+
+### 3.1 Multi-Adapter Serving
+
+MetalLoRA supports batched inference with per-sample adapter selection:
+
+```python
+manager = MultiAdapterManager(base_model)
+manager.add_adapter("user_1", weights_1)
+manager.add_adapter("user_2", weights_2)
+output = manager.forward_batched(x, adapter_ids=[0, 1, 0, 1])
 ```
 
-**Benefit:** 2x memory bandwidth, 2x ALU throughput, no accuracy loss.
+This enables efficient multi-tenant serving without model duplication.
 
-### 5. QLoRA (4-bit Quantization)
+### 3.2 Speculative Decoding
 
-Base weights stored as 4-bit NF4 (Normal Float 4):
-- 16 optimal quantization levels for Gaussian distributions
-- 75% memory reduction (28GB → 7GB for 7B model)
-- On-the-fly dequantization in kernel
+For autoregressive generation, MetalLoRA implements speculative decoding:
 
-```metal
-constant float NF4_LEVELS[16] = {-1.0, -0.696, ..., 1.0};
-float w = NF4_LEVELS[packed & 0xF] * absmax;
-```
+1. Draft model proposes K tokens
+2. Target model verifies all K tokens in parallel
+3. Accept matching tokens, resample on mismatch
 
-### 6. Multi-Adapter Batching
+Expected speedup: 2-5× depending on draft model quality.
 
-Serve N adapters from single base model:
-- Pack all adapters into batched tensors `[N, R, K]`
-- Each sample in batch uses different adapter
-- Single kernel dispatch processes all
+### 3.3 Incremental KV-Cache
 
-**Use case:** Multi-tenant serving (100+ users, 1 GPU).
+LoRA-aware KV-cache updates fuse the projection and cache update operations, reducing redundant computation during incremental decoding.
 
-### 7. Speculative Decoding
-
-Small draft model proposes K tokens, target model verifies in parallel:
-- Draft: 5 tokens in 5 forward passes
-- Verify: 1 forward pass checks all 5
-- Accept: 3-4 tokens on average
-
-**Benefit:** 2-5x faster generation.
-
-## Architecture
+## 4. Architecture
 
 ```
-kernels/
-├── lora_kernels.metal   # Core + simdgroup + multi-adapter
-├── lora_train.metal     # Fused training kernels
-└── lora_quantized.metal # INT4/NF4 inference
-
-python/metal_lora/
-├── layers.py            # LoRALinear, LoRAEmbedding
-├── ops.py               # Low-level operations
-├── trainer.py           # Training infrastructure
-├── utils.py             # Save/load/apply
-└── optimizations.py     # Compression, pooling, speculative
+MetalLoRA/
+├── kernels/
+│   ├── lora_kernels.metal    # Fused forward, simdgroup, multi-adapter
+│   ├── lora_train.metal      # Training kernels with gradient fusion
+│   └── lora_quantized.metal  # INT4/NF4 quantized inference
+├── python/metal_lora/
+│   ├── layers.py             # LoRALinear, LoRAEmbedding
+│   ├── trainer.py            # Training infrastructure
+│   └── optimizations.py      # Compression, pooling, speculative
+└── TECHNICAL.md
 ```
 
-## Performance Targets
+## 5. Expected Performance
 
-| Optimization         | Expected Speedup    |
-| -------------------- | ------------------- |
-| Fused kernels        | 2-3x                |
-| simdgroup_matrix     | 2-4x                |
-| FP16                 | 2x                  |
-| QLoRA                | 4x memory reduction |
-| Speculative decoding | 2-5x generation     |
+| Configuration        | Metric             | Target       |
+| -------------------- | ------------------ | ------------ |
+| Fused vs unfused     | Dispatch reduction | 4×           |
+| simdgroup vs scalar  | FLOPS utilization  | 16×          |
+| FP16 vs FP32         | Memory bandwidth   | 2×           |
+| QLoRA vs FP16        | Memory footprint   | 4× reduction |
+| Speculative decoding | Token generation   | 2-5×         |
+
+## 6. Limitations
+
+- Requires Apple Silicon (M1 or later)
+- macOS 13+ for full Metal 3 support
+- Quantized kernels optimized for inference only
 
 ## References
 
-- [LoRA Paper](https://arxiv.org/abs/2106.09685)
-- [QLoRA Paper](https://arxiv.org/abs/2305.14314)
-- [Apple Metal Best Practices](https://developer.apple.com/metal/)
-- [MLX Framework](https://github.com/ml-explore/mlx)
+1. Hu et al., "LoRA: Low-Rank Adaptation of Large Language Models," 2021
+2. Dettmers et al., "QLoRA: Efficient Finetuning of Quantized LLMs," 2023
+3. Apple, "Metal Best Practices Guide," 2024
+4. Apple, "Optimizing Machine Learning on Apple Silicon," WWDC 2023
