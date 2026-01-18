@@ -35,6 +35,18 @@ from .advanced_ops import (
     dequantize_nf4,
 )
 
+# Extreme performance optimizations
+from .extreme_ops import (
+    detect_hardware,
+    get_hardware,
+    select_optimal_kernel,
+    GradientCheckpointedLoRA,
+    TensorParallelLoRA,
+    SpeculativeLoRADecoder,
+    FusedLoRAAdamW,
+    FusedLoRABlock,
+)
+
 __all__ = [
     # Core
     "LoRALinear",
@@ -53,4 +65,13 @@ __all__ = [
     "MultiAdapterLoRA",
     "quantize_nf4",
     "dequantize_nf4",
+    # Extreme
+    "detect_hardware",
+    "get_hardware",
+    "select_optimal_kernel",
+    "GradientCheckpointedLoRA",
+    "TensorParallelLoRA",
+    "SpeculativeLoRADecoder",
+    "FusedLoRAAdamW",
+    "FusedLoRABlock",
 ]
