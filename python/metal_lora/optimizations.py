@@ -198,7 +198,6 @@ class MultiAdapterManager:
         """Forward pass with different adapter per sample."""
         self._rebuild_batched()
 
-        batch_size = x.shape[0]
         ids = mx.array(adapter_ids)
 
         # Select adapters for each sample

@@ -212,18 +212,13 @@ def lora_forward_metal(
     out_features, in_features = w0.shape
     rank = a.shape[0]
 
-    # Flatten batch and seq dims if needed
-    original_shape = x.shape
+    # Extract batch and seq dims
     if x.ndim == 3:
         batch_size, seq_len, _ = x.shape
-        x_flat = x.reshape(-1, in_features)
     elif x.ndim == 2:
         batch_size, seq_len = 1, x.shape[0]
-        x_flat = x
     else:
         raise ValueError(f"Expected 2D or 3D input, got {x.ndim}D")
-
-    total_tokens = batch_size * seq_len
 
     # Choose kernel based on dimension sizes
     if use_simd and in_features >= 256:
