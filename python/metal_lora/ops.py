@@ -76,7 +76,7 @@ def lora_forward(
     if use_metal and is_metal_available() and not training:
         try:
             output = lora_forward_metal(
-                x=x, W0=W0, A=A, B=B,
+                x=x, w0=W0, a=A, b=B,
                 alpha=alpha,
                 batch_size=batch_size,
                 seq_len=seq_len,
@@ -159,7 +159,7 @@ def lora_backward_efficient(
         try:
             return lora_backward_metal(
                 grad_output=grad_output,
-                x=x, A=A, B=B,
+                x=x, a=A, b=B,
                 alpha=alpha,
                 clip_value=clip_value,
             )

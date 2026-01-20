@@ -9,7 +9,6 @@ is_metal_available() returns False and kernel functions raise RuntimeError.
 """
 
 import platform
-from typing import TYPE_CHECKING
 
 # Check if we're on macOS with Metal support
 _IS_MACOS = platform.system() == "Darwin"
@@ -28,9 +27,7 @@ if _IS_MACOS:
 
 _IS_METAL_AVAILABLE = _IS_MACOS and _mlx_available
 
-# Type hints for static analysis
-if TYPE_CHECKING:
-    import mlx.core as mx
+# Type hints for static analysis - mx is already defined above
 
 # =============================================================================
 # KERNEL SOURCES (MLX format - body only, signature auto-generated)

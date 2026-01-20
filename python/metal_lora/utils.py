@@ -9,12 +9,12 @@ import mlx.nn as nn
 
 def save_adapter(
     model: nn.Module,
-    path: str,
+    path: str | Path,
     adapter_name: str = "default",
 ) -> None:
     """Save LoRA adapter weights."""
-    path = Path(path)
-    path.mkdir(parents=True, exist_ok=True)
+    save_path = Path(path)
+    save_path.mkdir(parents=True, exist_ok=True)
 
     lora_params = {}
     for name, module in model.named_modules():
@@ -22,24 +22,24 @@ def save_adapter(
             lora_params[f"{name}.A"] = module.A
             lora_params[f"{name}.B"] = module.B
 
-    mx.save(str(path / f"{adapter_name}.safetensors"), lora_params)
+    mx.save(str(save_path / f"{adapter_name}.safetensors"), lora_params)
 
     config = {
         "adapter_name": adapter_name,
         "num_params": sum(p.size for p in lora_params.values()),
     }
-    with open(path / f"{adapter_name}_config.json", "w") as f:
+    with open(save_path / f"{adapter_name}_config.json", "w") as f:
         json.dump(config, f, indent=2)
 
 
 def load_adapter(
     model: nn.Module,
-    path: str,
+    path: str | Path,
     adapter_name: str = "default",
 ) -> nn.Module:
     """Load LoRA adapter weights into model."""
-    path = Path(path)
-    lora_params = mx.load(str(path / f"{adapter_name}.safetensors"))
+    load_path = Path(path)
+    lora_params = mx.load(str(load_path / f"{adapter_name}.safetensors"))
 
     for name, module in model.named_modules():
         a_key = f"{name}.A"
@@ -80,7 +80,7 @@ def apply_lora_to_model(
     return model
 
 
-def count_lora_parameters(model: nn.Module) -> dict[str, int]:
+def count_lora_parameters(model: nn.Module) -> dict[str, int | float]:
     """Count trainable and total parameters."""
     trainable = 0
     total = 0
@@ -96,7 +96,7 @@ def count_lora_parameters(model: nn.Module) -> dict[str, int]:
         "trainable": trainable,
         "total": total,
         "lora_layers": lora_layers,
-        "ratio": trainable / total if total > 0 else 0,
+        "ratio": trainable / total if total > 0 else 0.0,
     }
 
 

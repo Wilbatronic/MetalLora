@@ -187,7 +187,7 @@ class LoRATrainer:
         num_steps: int | None = None,
     ) -> dict[str, list[float]]:
         self.state.start_time = time.time()
-        history = {"loss": [], "step": []}
+        history: dict[str, list[float]] = {"loss": [], "step": []}
 
         print(f"Trainable: {self.model.num_trainable_params():,} | Total: {self.model.num_total_params():,}")
 
@@ -220,17 +220,17 @@ class LoRATrainer:
         self.save(f"{self.config.output_dir}/final")
         return history
 
-    def save(self, path: str):
-        path = Path(path)
-        path.mkdir(parents=True, exist_ok=True)
-        mx.save(str(path / "adapter.safetensors"), self.model.get_lora_params())
+    def save(self, path: str | Path) -> None:
+        save_path = Path(path)
+        save_path.mkdir(parents=True, exist_ok=True)
+        mx.save(str(save_path / "adapter.safetensors"), self.model.get_lora_params())
 
-        with open(path / "config.json", "w") as f:
+        with open(save_path / "config.json", "w") as f:
             json.dump({"rank": self.config.rank, "alpha": self.config.alpha}, f)
 
-    def load(self, path: str):
-        path = Path(path)
-        params = mx.load(str(path / "adapter.safetensors"))
+    def load(self, path: str | Path) -> None:
+        load_path = Path(path)
+        params = mx.load(str(load_path / "adapter.safetensors"))
         self.model.set_lora_params(params)
 
 

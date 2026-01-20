@@ -43,14 +43,14 @@ def decompress_weights(compressed: bytes) -> dict[str, mx.array]:
     return weights
 
 
-def save_compressed(weights: dict[str, mx.array], path: str) -> int:
+def save_compressed(weights: dict[str, mx.array], path: str | Path) -> int:
     """Save compressed weights, return bytes saved vs uncompressed."""
     compressed = compress_weights(weights)
 
-    path = Path(path)
-    path.parent.mkdir(parents=True, exist_ok=True)
+    save_path = Path(path)
+    save_path.parent.mkdir(parents=True, exist_ok=True)
 
-    with open(path, "wb") as f:
+    with open(save_path, "wb") as f:
         f.write(compressed)
 
     uncompressed_size = sum(a.size * 2 for a in weights.values())  # FP16
