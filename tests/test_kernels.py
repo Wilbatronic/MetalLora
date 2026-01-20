@@ -1,16 +1,16 @@
 """Unit tests for MetalLoRA."""
 
-import pytest
 import mlx.core as mx
+import pytest
 
 from metal_lora import (
-    LoRALinear,
+    ConfigurationError,
     LoRAEmbedding,
+    LoRALinear,
     lora_forward,
     merge_lora_weights,
-    ConfigurationError,
-    validate_rank,
     validate_alpha,
+    validate_rank,
 )
 
 
@@ -125,18 +125,18 @@ class TestOps:
     def test_lora_forward_shape(self):
         """Test forward output shape."""
         x = mx.random.normal((4, 16, 64))
-        W0 = mx.random.normal((128, 64))
-        A = mx.random.normal((8, 64))
-        B = mx.random.normal((128, 8))
-        out = lora_forward(x, W0, A, B)
+        w0 = mx.random.normal((128, 64))
+        a = mx.random.normal((8, 64))
+        b = mx.random.normal((128, 8))
+        out = lora_forward(x, w0, a, b)
         assert out.shape == (4, 16, 128)
 
     def test_merge_weights_shape(self):
         """Test merge output shape."""
-        W0 = mx.random.normal((128, 64))
-        A = mx.random.normal((8, 64))
-        B = mx.random.normal((128, 8))
-        merged = merge_lora_weights(W0, A, B)
+        w0 = mx.random.normal((128, 64))
+        a = mx.random.normal((8, 64))
+        b = mx.random.normal((128, 8))
+        merged = merge_lora_weights(w0, a, b)
         assert merged.shape == (128, 64)
 
 
