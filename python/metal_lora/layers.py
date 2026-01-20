@@ -1,13 +1,13 @@
 """LoRA layers for MLX."""
 
-import mlx.core as mx
-import mlx.nn as nn
-from typing import Optional, Dict
 import math
 
-from .ops import lora_forward, lora_backward_efficient, merge_lora_weights
-from .exceptions import validate_rank, validate_alpha, validate_probability, ConfigurationError
+import mlx.core as mx
+import mlx.nn as nn
+
+from .exceptions import ConfigurationError, validate_alpha, validate_probability, validate_rank
 from .logging import logger
+from .ops import lora_forward, merge_lora_weights
 
 
 class LoRALinear(nn.Module):
@@ -78,48 +78,48 @@ class LoRALinear(nn.Module):
             self.W0 = mx.stop_gradient(self.W0)
 
         logger.debug(f"LoRALinear: {in_features}→{out_features}, rank={rank}")
-    
+
     def __call__(self, x: mx.array) -> mx.array:
         original_shape = x.shape
-        
+
         if x.ndim == 2:
             x = x[None, :, :]
         elif x.ndim > 3:
             batch_dims = x.shape[:-1]
             x = x.reshape(-1, x.shape[-2], x.shape[-1])
-        
+
         out = lora_forward(
             x=x, W0=self.W0, A=self.A, B=self.B,
             alpha=self.alpha, dropout=self.dropout, training=self.training,
         )
-        
+
         if self.bias is not None:
             out = out + self.bias
-        
+
         if len(original_shape) == 2:
             out = out.squeeze(0)
         elif len(original_shape) > 3:
             out = out.reshape(*batch_dims, out.shape[-1])
-        
+
         return out
-    
+
     def merge_weights(self) -> mx.array:
         """Merge LoRA into base weights."""
         return merge_lora_weights(self.W0, self.A, self.B, self.alpha)
-    
+
     def to_inference_mode(self) -> "LoRALinear":
         """Merge weights for inference."""
         self.W0 = self.merge_weights()
         self.A = mx.zeros_like(self.A)
         self.B = mx.zeros_like(self.B)
         return self
-    
+
     @classmethod
     def from_linear(cls, linear: nn.Linear, rank: int = 8, alpha: float = 16.0, dropout: float = 0.0) -> "LoRALinear":
         """Create from existing nn.Linear."""
         in_features = linear.weight.shape[1]
         out_features = linear.weight.shape[0]
-        
+
         lora = cls(
             in_features=in_features,
             out_features=out_features,
@@ -129,26 +129,26 @@ class LoRALinear(nn.Module):
             use_bias=linear.bias is not None,
             freeze_base=True,
         )
-        
+
         lora.W0 = linear.weight
         if linear.bias is not None:
             lora.bias = linear.bias
-        
+
         return lora
-    
+
     def trainable_parameters(self) -> dict:
         """Get trainable LoRA parameters."""
         params = {"A": self.A, "B": self.B}
         if self.bias is not None and not self.freeze_base:
             params["bias"] = self.bias
         return params
-    
+
     def num_trainable_params(self) -> int:
         count = self.A.size + self.B.size
         if self.bias is not None and not self.freeze_base:
             count += self.bias.size
         return count
-    
+
     def num_total_params(self) -> int:
         count = self.W0.size + self.A.size + self.B.size
         if self.bias is not None:
@@ -158,7 +158,7 @@ class LoRALinear(nn.Module):
 
 class LoRAEmbedding(nn.Module):
     """Embedding layer with LoRA adaptation."""
-    
+
     def __init__(
         self,
         num_embeddings: int,
@@ -168,28 +168,28 @@ class LoRAEmbedding(nn.Module):
         freeze_base: bool = True,
     ):
         super().__init__()
-        
+
         self.num_embeddings = num_embeddings
         self.embedding_dim = embedding_dim
         self.rank = rank
         self.alpha = alpha
-        
+
         self.embeddings = mx.random.normal((num_embeddings, embedding_dim)) * 0.02
-        
+
         bound = 1.0 / math.sqrt(embedding_dim)
         self.A = mx.random.uniform(-bound, bound, (rank, embedding_dim))
         self.B = mx.zeros((num_embeddings, rank))
-        
+
         if freeze_base:
             self.embeddings = mx.stop_gradient(self.embeddings)
-    
+
     def __call__(self, indices: mx.array) -> mx.array:
         base_emb = self.embeddings[indices]
         scale = self.alpha / self.rank
-        B_selected = self.B[indices]
-        lora_emb = mx.matmul(B_selected, self.A)
+        b_selected = self.B[indices]  # noqa: N806
+        lora_emb = mx.matmul(b_selected, self.A)
         return base_emb + scale * lora_emb
-    
+
     def merge_weights(self) -> mx.array:
         scale = self.alpha / self.rank
         return self.embeddings + scale * mx.matmul(self.B, self.A)

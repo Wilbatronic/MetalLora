@@ -2,13 +2,12 @@
 
 import logging
 import sys
-from typing import Optional
 
 
-def get_logger(name: str = "metal_lora", level: Optional[int] = None) -> logging.Logger:
+def get_logger(name: str = "metal_lora", level: int | None = None) -> logging.Logger:
     """Get configured logger."""
     logger = logging.getLogger(name)
-    
+
     if not logger.handlers:
         handler = logging.StreamHandler(sys.stdout)
         handler.setFormatter(logging.Formatter(
@@ -16,12 +15,12 @@ def get_logger(name: str = "metal_lora", level: Optional[int] = None) -> logging
             datefmt="%Y-%m-%d %H:%M:%S"
         ))
         logger.addHandler(handler)
-    
+
     if level is not None:
         logger.setLevel(level)
     elif logger.level == logging.NOTSET:
         logger.setLevel(logging.INFO)
-    
+
     return logger
 
 

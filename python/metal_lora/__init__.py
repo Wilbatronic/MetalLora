@@ -2,30 +2,43 @@
 
 __version__ = "0.1.0"
 
-from .layers import LoRALinear, LoRAEmbedding
-from .ops import lora_forward, lora_backward, merge_lora_weights
-from .utils import save_adapter, load_adapter, apply_lora_to_model, count_lora_parameters
-from .trainer import LoRATrainer, TrainingConfig, TrainingState, train_lora, quick_finetune
+from .exceptions import (
+    AdapterError,
+    ConfigurationError,
+    DeviceError,
+    MetalLoRAError,
+    ShapeError,
+    validate_alpha,
+    validate_probability,
+    validate_rank,
+)
+from .kernels import is_metal_available, lora_backward_metal, lora_forward_metal
+from .layers import LoRAEmbedding, LoRALinear
+from .logging import disable_logging, enable_debug, get_logger, logger, set_log_level
+from .ops import lora_backward, lora_forward, merge_lora_weights
 from .optimizations import (
-    compress_weights, decompress_weights, save_compressed, load_compressed,
-    MemoryPool, get_memory_pool,
+    FusedGradAccumulator,
+    LazyLoRA,
+    LoRAKVCache,
+    MemoryPool,
+    MixedPrecisionConfig,
+    MixedPrecisionTrainer,
     MultiAdapterManager,
     SpeculativeDecoder,
-    LoRAKVCache,
-    LazyLoRA,
-    MixedPrecisionConfig, MixedPrecisionTrainer,
-    FusedGradAccumulator,
+    compress_weights,
+    decompress_weights,
+    get_memory_pool,
+    load_compressed,
+    save_compressed,
 )
-from .exceptions import (
-    MetalLoRAError, ConfigurationError, ShapeError, DeviceError, AdapterError,
-    validate_rank, validate_alpha, validate_probability,
-)
-from .logging import logger, get_logger, set_log_level, enable_debug, disable_logging
+from .trainer import LoRATrainer, TrainingConfig, TrainingState, quick_finetune, train_lora
+from .utils import apply_lora_to_model, count_lora_parameters, load_adapter, save_adapter
 
 __all__ = [
     # Core
     "LoRALinear", "LoRAEmbedding",
     "lora_forward", "lora_backward", "merge_lora_weights",
+    "is_metal_available", "lora_forward_metal", "lora_backward_metal",
     "save_adapter", "load_adapter", "apply_lora_to_model", "count_lora_parameters",
     # Training
     "LoRATrainer", "TrainingConfig", "TrainingState", "train_lora", "quick_finetune",
