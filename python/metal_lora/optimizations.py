@@ -4,6 +4,7 @@ import json
 import zlib
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Any
 
 import mlx.core as mx
 import mlx.nn as nn
