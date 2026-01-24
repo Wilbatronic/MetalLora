@@ -1,31 +1,55 @@
 """Low-level LoRA operations with optional Metal kernel dispatch."""
 
-import mlx.core as mx
+from __future__ import annotations
+
+import platform
+from typing import TYPE_CHECKING, Any
+
+# Conditional MLX import (only available on macOS with Apple Silicon)
+_IS_MACOS = platform.system() == "Darwin"
+
+if _IS_MACOS:
+    try:
+        import mlx.core as mx
+        _MLX_AVAILABLE = True
+    except ImportError:
+        mx = None  # type: ignore
+        _MLX_AVAILABLE = False
+else:
+    mx = None  # type: ignore
+    _MLX_AVAILABLE = False
 
 from .kernels import is_metal_available, lora_backward_metal, lora_forward_metal
 
+# Type alias for array (allows static type checking while supporting runtime None)
+if TYPE_CHECKING:
+    import mlx.core
+    Array = mlx.core.array
+else:
+    Array = Any
+
 
 def lora_forward(
-    x: mx.array,
-    W0: mx.array,  # noqa: N803
-    A: mx.array,  # noqa: N803
-    B: mx.array,  # noqa: N803
+    x: Array,
+    W0: Array,  # noqa: N803
+    A: Array,  # noqa: N803
+    B: Array,  # noqa: N803
     alpha: float = 16.0,
     dropout: float = 0.0,
     training: bool = False,
     use_metal: bool = True,
-) -> mx.array:
+) -> Array:
     """LoRA forward: h = W0 @ x + (alpha/rank) * B @ A @ x
 
     Parameters
     ----------
-    x : mx.array
+    x : array
         Input tensor, shape [batch, seq, in_features] or [seq, in_features]
-    W0 : mx.array
+    W0 : array
         Base weight matrix [out_features, in_features]
-    A : mx.array
+    A : array
         LoRA down projection [rank, in_features]
-    B : mx.array
+    B : array
         LoRA up projection [out_features, rank]
     alpha : float
         LoRA scaling factor
@@ -38,14 +62,13 @@ def lora_forward(
 
     Returns
     -------
-    mx.array
+    array
         Output tensor with same batch/seq dims and out_features last dim
     """
     original_ndim = x.ndim
     if x.ndim == 2:
         x = x[None, :, :]
 
-    _, _, _ = x.shape  # Validate 3D
     _, rank = B.shape
     scale = alpha / rank
 
@@ -72,22 +95,26 @@ def lora_forward(
     return output
 
 
-def lora_forward_inference(x: mx.array, w_merged: mx.array) -> mx.array:
+def lora_forward_inference(x: Array, w_merged: Array) -> Array:
     """Inference forward with merged weights."""
+    original_ndim = x.ndim
     if x.ndim == 2:
         x = x[None, :, :]
-    return mx.matmul(x, w_merged.T)
+    output = mx.matmul(x, w_merged.T)
+    if original_ndim == 2:
+        output = output.squeeze(0)
+    return output
 
 
 def lora_backward(
-    grad_output: mx.array,
-    x: mx.array,
-    A: mx.array,  # noqa: N803
-    B: mx.array,  # noqa: N803
+    grad_output: Array,
+    x: Array,
+    A: Array,  # noqa: N803
+    B: Array,  # noqa: N803
     alpha: float = 16.0,
     clip_value: float = 1.0,
     use_metal: bool = True,
-) -> tuple[mx.array, mx.array]:
+) -> tuple[Array, Array]:
     """Compute gradients for A and B using efficient batched matmul.
 
     Parameters
@@ -125,11 +152,11 @@ lora_backward_efficient = lora_backward
 
 
 def merge_lora_weights(
-    W0: mx.array,  # noqa: N803
-    A: mx.array,  # noqa: N803
-    B: mx.array,  # noqa: N803
+    W0: Array,  # noqa: N803
+    A: Array,  # noqa: N803
+    B: Array,  # noqa: N803
     alpha: float = 16.0,
-) -> mx.array:
+) -> Array:
     """Merge LoRA into base weights: W' = W0 + (alpha/rank) * B @ A"""
     rank = A.shape[0]
     scale = alpha / rank
@@ -138,12 +165,12 @@ def merge_lora_weights(
 
 
 def unmerge_lora_weights(
-    w_merged: mx.array,
-    W0: mx.array,  # noqa: N803
-    A: mx.array,  # noqa: N803
-    B: mx.array,  # noqa: N803
+    w_merged: Array,
+    W0: Array,  # noqa: N803
+    A: Array,  # noqa: N803
+    B: Array,  # noqa: N803
     alpha: float = 16.0,
-) -> tuple[mx.array, mx.array]:
+) -> tuple[Array, Array]:
     """Recover LoRA from merged weights using SVD."""
     rank = A.shape[0]
     scale = alpha / rank
