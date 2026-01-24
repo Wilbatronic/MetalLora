@@ -1,32 +1,8 @@
 """Low-level LoRA operations with optional Metal kernel dispatch."""
 
-from pathlib import Path
-
 import mlx.core as mx
 
-# Import Metal kernel functions
 from .kernels import is_metal_available, lora_backward_metal, lora_forward_metal
-
-
-def _get_kernel_source() -> str:
-    """Load Metal kernel sources (for reference/documentation)."""
-    kernel_dir = Path(__file__).parent.parent.parent / "kernels"
-    sources = []
-    for filename in ["lora_kernels.metal", "lora_train.metal", "lora_quantized.metal"]:
-        kernel_path = kernel_dir / filename
-        if kernel_path.exists():
-            sources.append(kernel_path.read_text())
-    return "\n".join(sources)
-
-
-_KERNEL_SOURCE: str | None = None
-
-
-def get_kernel_source() -> str:
-    global _KERNEL_SOURCE
-    if _KERNEL_SOURCE is None:
-        _KERNEL_SOURCE = _get_kernel_source()
-    return _KERNEL_SOURCE
 
 
 def lora_forward(
@@ -65,44 +41,38 @@ def lora_forward(
     mx.array
         Output tensor with same batch/seq dims and out_features last dim
     """
+    original_ndim = x.ndim
     if x.ndim == 2:
         x = x[None, :, :]
 
-    batch_size, seq_len, in_features = x.shape
-    out_features, rank = B.shape
+    _, _, _ = x.shape  # Validate 3D
+    _, rank = B.shape
     scale = alpha / rank
 
-    # Try Metal kernel path
+    # Try Metal kernel path (inference only)
     if use_metal and is_metal_available() and not training:
         try:
-            output = lora_forward_metal(
-                x=x, w0=W0, a=A, b=B,
-                alpha=alpha,
-                batch_size=batch_size,
-                seq_len=seq_len,
-                use_simd=(in_features >= 256),
-            )
-            return output
+            return lora_forward_metal(x=x, w0=W0, a=A, b=B, alpha=alpha)
         except Exception:
-            # Fall back to MLX on any kernel error
-            pass
+            pass  # Fall back to MLX
 
-    # Pure MLX fallback
+    # Pure MLX path
+    w0x = mx.matmul(x, W0.T)
     ax = mx.matmul(x, A.T)
     bax = mx.matmul(ax, B.T)
-    w0x = mx.matmul(x, W0.T)
-
     output = w0x + scale * bax
 
     if training and dropout > 0:
         mask = mx.random.bernoulli(1 - dropout, bax.shape)
-        dropout_scale = 1.0 / (1.0 - dropout)
-        output = w0x + scale * bax * mask * dropout_scale
+        output = w0x + scale * bax * mask / (1.0 - dropout)
+
+    if original_ndim == 2:
+        output = output.squeeze(0)
 
     return output
 
 
-def lora_forward_inference(x: mx.array, w_merged: mx.array) -> mx.array:  # noqa: N803
+def lora_forward_inference(x: mx.array, w_merged: mx.array) -> mx.array:
     """Inference forward with merged weights."""
     if x.ndim == 2:
         x = x[None, :, :]
@@ -116,38 +86,9 @@ def lora_backward(
     B: mx.array,  # noqa: N803
     alpha: float = 16.0,
     clip_value: float = 1.0,
-) -> tuple[mx.array, mx.array]:
-    """Compute gradients for A and B."""
-    batch_size, seq_len, out_features = grad_output.shape
-    rank, in_features = A.shape
-    scale = alpha / rank
-
-    ax = mx.matmul(x, A.T)
-    bt_grad = mx.matmul(grad_output, B)
-
-    grad_b = mx.zeros((out_features, rank))
-    grad_a = mx.zeros((rank, in_features))
-
-    for b in range(batch_size):
-        grad_b = grad_b + mx.matmul(grad_output[b].T, ax[b])
-        grad_a = grad_a + mx.matmul(bt_grad[b].T, x[b])
-
-    grad_b = mx.clip(scale * grad_b, -clip_value, clip_value)
-    grad_a = mx.clip(scale * grad_a, -clip_value, clip_value)
-
-    return grad_a, grad_b
-
-
-def lora_backward_efficient(
-    grad_output: mx.array,
-    x: mx.array,
-    A: mx.array,  # noqa: N803
-    B: mx.array,  # noqa: N803
-    alpha: float = 16.0,
-    clip_value: float = 1.0,
     use_metal: bool = True,
 ) -> tuple[mx.array, mx.array]:
-    """Memory-efficient backward using batched matmul.
+    """Compute gradients for A and B using efficient batched matmul.
 
     Parameters
     ----------
@@ -158,33 +99,29 @@ def lora_backward_efficient(
     if use_metal and is_metal_available():
         try:
             return lora_backward_metal(
-                grad_output=grad_output,
-                x=x, a=A, b=B,
-                alpha=alpha,
-                clip_value=clip_value,
+                grad_output=grad_output, x=x, a=A, b=B,
+                alpha=alpha, clip_value=clip_value,
             )
         except Exception:
             pass
 
-    # Pure MLX fallback
-    batch_size, seq_len, out_features = grad_output.shape
-    rank, in_features = A.shape
+    # Pure MLX batched computation
+    rank, _ = A.shape
     scale = alpha / rank
 
+    # grad_B = scale * sum_batch(grad_output.T @ (x @ A.T))
     ax = mx.matmul(x, A.T)
-    grad_output_t = mx.transpose(grad_output, (0, 2, 1))
-    grad_b_batched = mx.matmul(grad_output_t, ax)
-    grad_b = scale * mx.sum(grad_b_batched, axis=0)
+    grad_b = scale * mx.sum(mx.matmul(mx.transpose(grad_output, (0, 2, 1)), ax), axis=0)
 
+    # grad_A = scale * sum_batch((grad_output @ B).T @ x)
     bt_grad = mx.matmul(grad_output, B)
-    bt_grad_t = mx.transpose(bt_grad, (0, 2, 1))
-    grad_a_batched = mx.matmul(bt_grad_t, x)
-    grad_a = scale * mx.sum(grad_a_batched, axis=0)
+    grad_a = scale * mx.sum(mx.matmul(mx.transpose(bt_grad, (0, 2, 1)), x), axis=0)
 
-    grad_a = mx.clip(grad_a, -clip_value, clip_value)
-    grad_b = mx.clip(grad_b, -clip_value, clip_value)
+    return mx.clip(grad_a, -clip_value, clip_value), mx.clip(grad_b, -clip_value, clip_value)
 
-    return grad_a, grad_b
+
+# Alias for backwards compatibility
+lora_backward_efficient = lora_backward
 
 
 def merge_lora_weights(
