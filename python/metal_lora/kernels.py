@@ -231,7 +231,7 @@ def lora_forward_metal(
         threadgroup_size = (256, 1, 1)
         grid = (out_features, seq_len, batch_size)
 
-    # Dispatch kernel
+    # Dispatch kernel - constants passed as keyword arguments
     outputs = kernel(
         inputs=[x, w0, a, b],
         template=[("T", x.dtype)],
@@ -239,8 +239,6 @@ def lora_forward_metal(
         threadgroup=threadgroup_size,
         output_shapes=[(batch_size, seq_len, out_features)],
         output_dtypes=[x.dtype],
-        init_value=0.0,
-        # Pass constants
         batch_size=batch_size,
         seq_len=seq_len,
         in_features=in_features,
