@@ -31,6 +31,7 @@ _IS_METAL_AVAILABLE = _IS_MACOS and _mlx_available
 
 # =============================================================================
 # KERNEL SOURCES (MLX format - body only, signature auto-generated)
+# Constants are passed as scalar inputs and accessed as arrays
 # =============================================================================
 
 # Fused LoRA forward: h = W0 @ x + (alpha/rank) * B @ A @ x
@@ -39,6 +40,14 @@ LORA_FORWARD_SOURCE = """
     uint batch_idx = thread_position_in_grid.z;
     uint seq_idx = thread_position_in_grid.y;
     uint d = thread_position_in_grid.x;
+
+    // Read constants from scalar inputs
+    uint batch_size = const_batch_size[0];
+    uint seq_len = const_seq_len[0];
+    uint in_features = const_in_features[0];
+    uint out_features = const_out_features[0];
+    uint rank = const_rank[0];
+    float alpha = const_alpha[0];
 
     // Early exit for out-of-bounds threads
     if (batch_idx >= batch_size || seq_idx >= seq_len || d >= out_features) return;
@@ -67,56 +76,11 @@ LORA_FORWARD_SOURCE = """
     out[out_offset + d] = T(h + scale_val * lora);
 """
 
-# Optimized forward with simd reduction for large dimensions
-LORA_FORWARD_SIMD_SOURCE = """
-    uint batch_idx = threadgroup_position_in_grid.z;
-    uint seq_idx = threadgroup_position_in_grid.y;
-    uint d_base = threadgroup_position_in_grid.x * threads_per_threadgroup.x;
-    uint lid = thread_index_in_threadgroup.x;
-    uint d = d_base + lid;
-
-    if (batch_idx >= batch_size || seq_idx >= seq_len) return;
-
-    float scale_val = alpha / float(rank);
-    uint x_offset = (batch_idx * seq_len + seq_idx) * in_features;
-    uint out_offset = (batch_idx * seq_len + seq_idx) * out_features;
-
-    // Compute Ax for all ranks using simd reduction
-    float ax_local[64];  // Max rank 64
-    for (uint r = 0; r < rank && r < 64; ++r) {
-        float ax = 0.0f;
-        for (uint k = thread_index_in_simdgroup; k < in_features; k += 32) {
-            ax += float(A[r * in_features + k]) * float(x[x_offset + k]);
-        }
-        ax_local[r] = simd_sum(ax);
-    }
-
-    if (d >= out_features) return;
-
-    // Compute W0 @ x with simd reduction
-    float h = 0.0f;
-    for (uint k = thread_index_in_simdgroup; k < in_features; k += 32) {
-        h += float(W0[d * in_features + k]) * float(x[x_offset + k]);
-    }
-    h = simd_sum(h);
-
-    // Compute LoRA contribution
-    float lora = 0.0f;
-    for (uint r = 0; r < rank && r < 64; ++r) {
-        lora += float(B[d * rank + r]) * ax_local[r];
-    }
-
-    if (thread_index_in_simdgroup == 0) {
-        out[out_offset + d] = T(h + scale_val * lora);
-    }
-"""
-
 # =============================================================================
 # KERNEL BUILDERS
 # =============================================================================
 
 _lora_forward_kernel: object | None = None
-_lora_forward_simd_kernel: object | None = None
 
 
 def _build_lora_forward_kernel():
@@ -125,24 +89,12 @@ def _build_lora_forward_kernel():
     if _lora_forward_kernel is None and mx is not None:
         _lora_forward_kernel = mx.fast.metal_kernel(
             name="lora_forward",
-            input_names=["x", "W0", "A", "B"],
+            input_names=["x", "W0", "A", "B", "const_batch_size", "const_seq_len",
+                         "const_in_features", "const_out_features", "const_rank", "const_alpha"],
             output_names=["out"],
             source=LORA_FORWARD_SOURCE,
         )
     return _lora_forward_kernel
-
-
-def _build_lora_forward_simd_kernel():
-    """Build the SIMD-optimized LoRA forward kernel."""
-    global _lora_forward_simd_kernel
-    if _lora_forward_simd_kernel is None and mx is not None:
-        _lora_forward_simd_kernel = mx.fast.metal_kernel(
-            name="lora_forward_simd",
-            input_names=["x", "W0", "A", "B"],
-            output_names=["out"],
-            source=LORA_FORWARD_SIMD_SOURCE,
-        )
-    return _lora_forward_simd_kernel
 
 
 # =============================================================================
@@ -165,7 +117,7 @@ def lora_forward_metal(
     alpha: float = 16.0,
     batch_size: int = 1,
     seq_len: int = 1,
-    use_simd: bool = False,
+    use_simd: bool = False,  # Kept for API compatibility, not used in simplified version
 ):
     """LoRA forward using custom Metal kernel.
 
@@ -188,7 +140,7 @@ def lora_forward_metal(
     seq_len : int
         Sequence length
     use_simd : bool
-        Use SIMD-optimized kernel for large dimensions
+        Use SIMD-optimized kernel (currently not implemented)
 
     Returns
     -------
@@ -217,34 +169,30 @@ def lora_forward_metal(
     else:
         raise ValueError(f"Expected 2D or 3D input, got {x.ndim}D")
 
-    # Choose kernel based on dimension sizes
-    if use_simd and in_features >= 256:
-        kernel = _build_lora_forward_simd_kernel()
-        threadgroup_size = (32, 1, 1)  # One simdgroup per output
-        grid = (
-            (out_features + 31) // 32 * 32,
-            seq_len,
-            batch_size,
-        )
-    else:
-        kernel = _build_lora_forward_kernel()
-        threadgroup_size = (256, 1, 1)
-        grid = (out_features, seq_len, batch_size)
+    # Build kernel
+    kernel = _build_lora_forward_kernel()
 
-    # Dispatch kernel - constants passed as keyword arguments
+    # Create scalar constant arrays
+    const_batch_size = mx.array([batch_size], dtype=mx.uint32)
+    const_seq_len = mx.array([seq_len], dtype=mx.uint32)
+    const_in_features = mx.array([in_features], dtype=mx.uint32)
+    const_out_features = mx.array([out_features], dtype=mx.uint32)
+    const_rank = mx.array([rank], dtype=mx.uint32)
+    const_alpha = mx.array([alpha], dtype=mx.float32)
+
+    # Grid: one thread per output element
+    grid = (out_features, seq_len, batch_size)
+    threadgroup_size = (min(256, out_features), 1, 1)
+
+    # Dispatch kernel - constants passed as scalar array inputs
     outputs = kernel(
-        inputs=[x, w0, a, b],
+        inputs=[x, w0, a, b, const_batch_size, const_seq_len,
+                const_in_features, const_out_features, const_rank, const_alpha],
         template=[("T", x.dtype)],
         grid=grid,
         threadgroup=threadgroup_size,
         output_shapes=[(batch_size, seq_len, out_features)],
         output_dtypes=[x.dtype],
-        batch_size=batch_size,
-        seq_len=seq_len,
-        in_features=in_features,
-        out_features=out_features,
-        rank=rank,
-        alpha=alpha,
     )
 
     return outputs[0]
