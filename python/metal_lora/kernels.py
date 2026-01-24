@@ -99,15 +99,104 @@ LORA_FORWARD_SOURCE = """
 """
 
 # =============================================================================
+# SIMD-OPTIMIZED KERNEL
+# Uses threadgroup memory to cache x and Ax intermediate results.
+# Each threadgroup processes one (batch, seq) position.
+# Threads cooperate to compute A @ x once, then each computes its output.
+# =============================================================================
+
+LORA_FORWARD_SIMD_SOURCE = """
+    // Thread identification
+    uint batch_idx = threadgroup_position_in_grid.z;
+    uint seq_idx = threadgroup_position_in_grid.y;
+    uint tg_base_d = threadgroup_position_in_grid.x * threads_per_threadgroup.x;
+    uint local_d = thread_index_in_threadgroup.x;
+    uint d = tg_base_d + local_d;
+
+    // Read constants
+    uint batch_size_val = const_batch_size[0];
+    uint seq_len_val = const_seq_len[0];
+    uint in_features_val = const_in_features[0];
+    uint out_features_val = const_out_features[0];
+    uint rank_val = const_rank[0];
+    float scale = const_alpha[0] / float(rank_val);
+
+    // Early exit for out-of-bounds threadgroups
+    if (batch_idx >= batch_size_val || seq_idx >= seq_len_val) return;
+
+    uint x_base = (batch_idx * seq_len_val + seq_idx) * in_features_val;
+    uint out_base = (batch_idx * seq_len_val + seq_idx) * out_features_val;
+
+    // Threadgroup memory for caching x and Ax
+    // Max 4096 in_features, max 128 rank (configurable)
+    threadgroup float tg_x[4096];
+    threadgroup float tg_Ax[128];
+
+    uint tg_size = threads_per_threadgroup.x;
+
+    // Cooperatively load x into threadgroup memory
+    for (uint k = local_d; k < in_features_val; k += tg_size) {
+        tg_x[k] = float(x[x_base + k]);
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    // Cooperatively compute A @ x (each thread handles subset of ranks)
+    for (uint r = local_d; r < rank_val; r += tg_size) {
+        float ax = 0.0f;
+        uint a_base = r * in_features_val;
+
+        // Vectorized dot product
+        uint k_vec = in_features_val / 4;
+        for (uint k4 = 0; k4 < k_vec; ++k4) {
+            uint k = k4 * 4;
+            float4 a_vec = float4(A[a_base + k], A[a_base + k + 1], A[a_base + k + 2], A[a_base + k + 3]);
+            float4 x_vec = float4(tg_x[k], tg_x[k + 1], tg_x[k + 2], tg_x[k + 3]);
+            ax += dot(a_vec, x_vec);
+        }
+        for (uint k = k_vec * 4; k < in_features_val; ++k) {
+            ax += A[a_base + k] * tg_x[k];
+        }
+        tg_Ax[r] = ax;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    // Each thread computes one output element
+    if (d >= out_features_val) return;
+
+    // Compute W0[d, :] @ x
+    float h = 0.0f;
+    uint w_base = d * in_features_val;
+    uint k_vec = in_features_val / 4;
+    for (uint k4 = 0; k4 < k_vec; ++k4) {
+        uint k = k4 * 4;
+        float4 w_vec = float4(W0[w_base + k], W0[w_base + k + 1], W0[w_base + k + 2], W0[w_base + k + 3]);
+        float4 x_vec = float4(tg_x[k], tg_x[k + 1], tg_x[k + 2], tg_x[k + 3]);
+        h += dot(w_vec, x_vec);
+    }
+    for (uint k = k_vec * 4; k < in_features_val; ++k) {
+        h += W0[w_base + k] * tg_x[k];
+    }
+
+    // Compute B[d, :] @ Ax (using cached Ax)
+    float lora = 0.0f;
+    for (uint r = 0; r < rank_val; ++r) {
+        lora += float(B[d * rank_val + r]) * tg_Ax[r];
+    }
+
+    out[out_base + d] = T(h + scale * lora);
+"""
+
+# =============================================================================
 # KERNEL BUILDERS
 # Kernels are JIT-compiled on first use and cached globally.
 # =============================================================================
 
 _lora_forward_kernel = None
+_lora_forward_simd_kernel = None
 
 
 def _build_lora_forward_kernel():
-    """Build and cache the LoRA forward kernel."""
+    """Build and cache the basic LoRA forward kernel."""
     global _lora_forward_kernel
     if _lora_forward_kernel is None and mx is not None:
         _lora_forward_kernel = mx.fast.metal_kernel(
@@ -120,9 +209,28 @@ def _build_lora_forward_kernel():
             ],
             output_names=["out"],
             source=LORA_FORWARD_SOURCE,
-            ensure_row_contiguous=True,  # Explicit: inputs will be made contiguous
+            ensure_row_contiguous=True,
         )
     return _lora_forward_kernel
+
+
+def _build_lora_forward_simd_kernel():
+    """Build and cache the SIMD-optimized LoRA forward kernel."""
+    global _lora_forward_simd_kernel
+    if _lora_forward_simd_kernel is None and mx is not None:
+        _lora_forward_simd_kernel = mx.fast.metal_kernel(
+            name="lora_forward_simd",
+            input_names=[
+                "x", "W0", "A", "B",
+                "const_batch_size", "const_seq_len",
+                "const_in_features", "const_out_features",
+                "const_rank", "const_alpha"
+            ],
+            output_names=["out"],
+            source=LORA_FORWARD_SIMD_SOURCE,
+            ensure_row_contiguous=True,
+        )
+    return _lora_forward_simd_kernel
 
 
 # =============================================================================
@@ -145,7 +253,7 @@ def lora_forward_metal(
     alpha: float = 16.0,
     batch_size: int | None = None,  # Auto-detected from x
     seq_len: int | None = None,     # Auto-detected from x
-    use_simd: bool = False,         # Reserved for future SIMD variant
+    use_simd: bool | None = None,   # Auto-select based on dimensions
 ):
     """LoRA forward using custom Metal kernel.
 
@@ -170,8 +278,10 @@ def lora_forward_metal(
         Override batch size (auto-detected from x if None)
     seq_len : int, optional
         Override sequence length (auto-detected from x if None)
-    use_simd : bool
-        Reserved for future SIMD-optimized kernel variant
+    use_simd : bool, optional
+        Use SIMD-optimized kernel with threadgroup memory caching.
+        If None, auto-selects based on in_features (True if >= 256).
+        SIMD kernel is faster for larger dimensions.
 
     Returns
     -------
@@ -222,11 +332,13 @@ def lora_forward_metal(
             f"({out_features}, {rank})"
         )
 
-    # Build kernel (cached after first call)
-    kernel = _build_lora_forward_kernel()
+    # Auto-select kernel based on dimensions
+    # SIMD kernel benefits from threadgroup caching for larger dimensions
+    # but has overhead from barriers, so basic kernel is better for small dims
+    if use_simd is None:
+        use_simd = in_features >= 256 and rank <= 128 and in_features <= 4096
 
     # Create scalar constant arrays for kernel parameters
-    # Using explicit dtype to ensure correct interpretation in Metal
     c_batch = mx.array([batch_size_actual], dtype=mx.uint32)
     c_seq = mx.array([seq_len_actual], dtype=mx.uint32)
     c_in = mx.array([in_features], dtype=mx.uint32)
@@ -234,17 +346,25 @@ def lora_forward_metal(
     c_rank = mx.array([rank], dtype=mx.uint32)
     c_alpha = mx.array([alpha], dtype=mx.float32)
 
-    # Grid dimensions: one thread per output element
-    # grid.x = output dimension, grid.y = sequence position, grid.z = batch index
-    grid = (out_features, seq_len_actual, batch_size_actual)
+    if use_simd:
+        # SIMD kernel: threadgroups process (batch, seq) positions cooperatively
+        kernel = _build_lora_forward_simd_kernel()
 
-    # Threadgroup size: balance occupancy and register pressure
-    # Typically 256 threads per threadgroup is a good default
-    tg_x = min(256, out_features)
-    threadgroup = (tg_x, 1, 1)
+        # Each threadgroup handles one (batch, seq) and multiple output dims
+        tg_size = min(256, out_features)  # Threads per threadgroup
+        num_tg_x = (out_features + tg_size - 1) // tg_size  # Ceiling division
+
+        grid = (num_tg_x, seq_len_actual, batch_size_actual)
+        threadgroup = (tg_size, 1, 1)
+    else:
+        # Basic kernel: one thread per output element
+        kernel = _build_lora_forward_kernel()
+
+        grid = (out_features, seq_len_actual, batch_size_actual)
+        tg_x = min(256, out_features)
+        threadgroup = (tg_x, 1, 1)
 
     # Dispatch kernel
-    # Template T will be the dtype of x (typically float32 or float16)
     outputs = kernel(
         inputs=[x, w0, a, b, c_batch, c_seq, c_in, c_out, c_rank, c_alpha],
         template=[("T", x.dtype)],
