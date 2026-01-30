@@ -188,8 +188,9 @@ def run_benchmark(config: BenchmarkConfig, compare: bool = True) -> dict[str, Be
     results = {}
     total_samples = config.batch_size * config.seq_len
 
-    # Metal Kernel (if available)
-    if is_metal_available():
+    # Fused Metal Kernel - uses threadgroup memory to reduce bandwidth
+    benchmark_metal_kernel = True
+    if benchmark_metal_kernel and is_metal_available():
         try:
             fwd_time = benchmark_forward_metal(x, w0, a, b, config)
             bwd_time = benchmark_backward(x, w0, a, b, config, use_metal=True)

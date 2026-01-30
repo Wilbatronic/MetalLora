@@ -73,11 +73,17 @@ def lora_forward(
     _, rank = B.shape
     scale = alpha / rank
 
-    # Try Metal kernel path (inference only)
-    if use_metal and is_metal_available() and not training:
+    # Fused Metal kernel path
+    # The fused kernel keeps A@x in threadgroup memory instead of writing to VRAM,
+    # reducing memory bandwidth. Enable to benchmark against pure MLX.
+    use_metal_kernel = True  # Set False to always use pure MLX
+    if use_metal_kernel and use_metal and is_metal_available() and not training:
         try:
             kwargs = kernel_kwargs or {}
-            return lora_forward_metal(x=x, w0=W0, a=A, b=B, alpha=alpha, **kwargs)
+            result = lora_forward_metal(x=x, w0=W0, a=A, b=B, alpha=alpha, **kwargs)
+            if original_ndim == 2:
+                result = result.squeeze(0)
+            return result
         except Exception:
             pass  # Fall back to MLX
 

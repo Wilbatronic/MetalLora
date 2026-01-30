@@ -28,34 +28,27 @@ if _IS_MACOS:
 _IS_METAL_AVAILABLE = _IS_MACOS and _mlx_available
 
 # =============================================================================
-# KERNEL SOURCES (MLX format - body only, signature auto-generated)
-# Constants are passed as scalar inputs (1-element arrays)
+# FUSED LORA FORWARD KERNEL
+# Computes: h = W0 @ x + (alpha/rank) * B @ (A @ x) in one kernel
 #
-# MLX auto-generates the function signature based on input_names.
-# All inputs become device const T* pointers. Constants are 1-element arrays
-# that we index with [0] to read the scalar value.
+# Key optimization: A @ x result is kept in threadgroup memory (only ~128 floats)
+# instead of being written to VRAM. This reduces memory bandwidth significantly.
 #
-# Note: ensure_row_contiguous=True (default) means inputs are guaranteed
-# to be row-major contiguous, so flat indexing works correctly.
+# Grid: (num_threadgroups_x, seq_len, batch_size) where each TG handles 256 outputs
+# Threadgroup: (256, 1, 1)
 # =============================================================================
 
-# Fused LoRA forward: h = W0 @ x + (alpha/rank) * B @ A @ x
-# Uses threadgroup memory to compute A @ x cooperatively (once per sequence position)
-# Then each thread computes its own output element
-# Grid: (ceil(out_features/TG_SIZE), seq_len, batch_size) with TG_SIZE threads per group
-LORA_FORWARD_SOURCE = """
+LORA_FORWARD_FUSED_SOURCE = """
+    // Threadgroup-level indices
     uint batch_idx = threadgroup_position_in_grid.z;
     uint seq_idx = threadgroup_position_in_grid.y;
-    uint tg_id = threadgroup_position_in_grid.x;
+    uint tg_idx = threadgroup_position_in_grid.x;
     
-    // Local thread ID within threadgroup
-    uint lid = thread_position_in_grid.x % 256;
-    uint tg_size = 256;
+    // Thread-level index within threadgroup (0-255)
+    uint tid = thread_position_in_grid.x;
+    uint lid = tid - tg_idx * 256;  // Local thread ID
     
-    // Output element this thread is responsible for
-    uint d = tg_id * tg_size + lid;
-
-    // Read scalar constants
+    // Read constants
     uint batch_size_val = const_batch_size[0];
     uint seq_len_val = const_seq_len[0];
     uint in_features_val = const_in_features[0];
@@ -66,68 +59,93 @@ LORA_FORWARD_SOURCE = """
     // Early exit for invalid batch/seq
     if (batch_idx >= batch_size_val || seq_idx >= seq_len_val) return;
 
-    // Precompute base indices
+    // Base indices for this (batch, seq) position
     uint x_base = (batch_idx * seq_len_val + seq_idx) * in_features_val;
     uint out_base = (batch_idx * seq_len_val + seq_idx) * out_features_val;
     
-    // Shared memory for x and A @ x
-    threadgroup float tg_x[4096];
-    threadgroup float tg_Ax[128];  // Max rank 128
+    // =========================================================================
+    // THREADGROUP SHARED MEMORY
+    // tg_x: cached input vector (reused for W0@x and A@x)
+    // tg_Ax: cached A@x result (reused for all output elements)
+    // =========================================================================
+    threadgroup float tg_x[4096];   // Max in_features = 4096
+    threadgroup float tg_Ax[128];   // Max rank = 128
 
-    // Phase 1: Cooperatively load x into shared memory
-    for (uint k = lid; k < in_features_val; k += tg_size) {
+    // =========================================================================
+    // PHASE 1: Cooperative load of x into threadgroup memory
+    // All 256 threads participate, each loading multiple elements
+    // =========================================================================
+    for (uint k = lid; k < in_features_val; k += 256) {
         tg_x[k] = float(x[x_base + k]);
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
-    // Phase 2: Cooperatively compute A @ x (shared across all output threads)
-    for (uint r = lid; r < rank_val; r += tg_size) {
+    // =========================================================================
+    // PHASE 2: Cooperative computation of A @ x
+    // Only need 'rank' threads to compute (rank << 256), but all participate
+    // Result stored in tg_Ax and reused by ALL output computations
+    // =========================================================================
+    for (uint r = lid; r < rank_val; r += 256) {
         float ax = 0.0f;
         uint a_base = r * in_features_val;
         
-        // Vectorized dot product
-        uint k_vec = in_features_val / 4;
-        for (uint k4 = 0; k4 < k_vec; ++k4) {
+        // Vectorized dot product (4 floats at a time)
+        uint k4_max = in_features_val / 4;
+        for (uint k4 = 0; k4 < k4_max; ++k4) {
             uint k = k4 * 4;
-            float4 a_vec = float4(A[a_base + k], A[a_base + k + 1], A[a_base + k + 2], A[a_base + k + 3]);
-            float4 x_vec = float4(tg_x[k], tg_x[k+1], tg_x[k+2], tg_x[k+3]);
+            float4 a_vec = float4(A[a_base + k], A[a_base + k + 1], 
+                                  A[a_base + k + 2], A[a_base + k + 3]);
+            float4 x_vec = float4(tg_x[k], tg_x[k + 1], 
+                                  tg_x[k + 2], tg_x[k + 3]);
             ax += dot(a_vec, x_vec);
         }
-        // Handle remainder
-        for (uint k = k_vec * 4; k < in_features_val; ++k) {
+        // Handle remainder (if in_features not divisible by 4)
+        for (uint k = k4_max * 4; k < in_features_val; ++k) {
             ax += A[a_base + k] * tg_x[k];
         }
         tg_Ax[r] = ax;
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
-    // Phase 3: Each thread computes its own output element
+    // =========================================================================
+    // PHASE 3: Each thread computes ONE output element
+    // Reuses tg_x (for W0@x) and tg_Ax (for B@Ax)
+    // =========================================================================
+    uint d = tg_idx * 256 + lid;  // Output index for this thread
+    
     if (d >= out_features_val) return;
     
-    uint w_base = d * in_features_val;
-    
-    // Compute W0[d,:] @ x (vectorized)
+    // Compute W0[d,:] @ x using vectorized loads
     float h = 0.0f;
-    uint k_vec = in_features_val / 4;
-    for (uint k4 = 0; k4 < k_vec; ++k4) {
+    uint w_base = d * in_features_val;
+    uint k4_max = in_features_val / 4;
+    
+    for (uint k4 = 0; k4 < k4_max; ++k4) {
         uint k = k4 * 4;
-        float4 w_vec = float4(W0[w_base + k], W0[w_base + k + 1], W0[w_base + k + 2], W0[w_base + k + 3]);
-        float4 x_vec = float4(tg_x[k], tg_x[k+1], tg_x[k+2], tg_x[k+3]);
+        float4 w_vec = float4(W0[w_base + k], W0[w_base + k + 1],
+                              W0[w_base + k + 2], W0[w_base + k + 3]);
+        float4 x_vec = float4(tg_x[k], tg_x[k + 1], 
+                              tg_x[k + 2], tg_x[k + 3]);
         h += dot(w_vec, x_vec);
     }
     // Handle remainder
-    for (uint k = k_vec * 4; k < in_features_val; ++k) {
+    for (uint k = k4_max * 4; k < in_features_val; ++k) {
         h += W0[w_base + k] * tg_x[k];
     }
 
-    // Compute B[d,:] @ Ax (use precomputed shared Ax)
+    // Compute B[d,:] @ Ax using precomputed tg_Ax
     float lora = 0.0f;
     for (uint r = 0; r < rank_val; ++r) {
         lora += float(B[d * rank_val + r]) * tg_Ax[r];
     }
 
+    // Write final output
     out[out_base + d] = T(h + scale * lora);
 """
+
+# Keep the old source as a backup/reference
+LORA_FORWARD_SOURCE = LORA_FORWARD_FUSED_SOURCE
+
 
 # =============================================================================
 # SIMD-OPTIMIZED KERNEL (simdgroup_matrix)
