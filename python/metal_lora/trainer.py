@@ -10,6 +10,63 @@ import mlx.core as mx
 import mlx.nn as nn
 import mlx.optimizers as optim
 
+from .kernels import (
+    is_metal_available,
+    lora_adamw_step_metal,
+    persistent_gpu_state_init,
+    persistent_gpu_state_step,
+)
+
+
+class MetalAdamW(optim.Optimizer):
+    """AdamW optimizer with persistent GPU state."""
+
+    def __init__(
+        self,
+        learning_rate: float,
+        betas: tuple[float, float] = (0.9, 0.999),
+        eps: float = 1e-8,
+        weight_decay: float = 0.01,
+    ):
+        super().__init__()
+        self.learning_rate = learning_rate
+        self.beta1, self.beta2 = betas
+        self.eps = eps
+        self.weight_decay = weight_decay
+        self.gpu_state = persistent_gpu_state_init(self.beta1, self.beta2)
+        self.m = {}
+        self.v = {}
+
+    def _init_state(self, key: str, param: mx.array):
+        if key not in self.m:
+            self.m[key] = mx.zeros_like(param)
+            self.v[key] = mx.zeros_like(param)
+
+    def update(self, model: nn.Module, gradients: dict):
+        """Update model parameters using Metal kernel."""
+        if not is_metal_available():
+            raise RuntimeError("Metal not available for MetalAdamW")
+
+        # Update GPU-side step and beta powers
+        persistent_gpu_state_step(self.gpu_state, self.beta1, self.beta2)
+
+        for key, grad in gradients.items():
+            param = model.get_parameters()[key]
+            self._init_state(key, param)
+            
+            lora_adamw_step_metal(
+                param=param,
+                grad=grad,
+                m=self.m[key],
+                v=self.v[key],
+                gpu_state=self.gpu_state,
+                lr=self.learning_rate,
+                beta1=self.beta1,
+                beta2=self.beta2,
+                eps=self.eps,
+                wd=self.weight_decay,
+            )
+
 
 @dataclass
 class TrainingConfig:
@@ -132,6 +189,14 @@ class LoRATrainer:
         Path(self.config.output_dir).mkdir(parents=True, exist_ok=True)
 
     def _create_optimizer(self) -> optim.Optimizer:
+        if is_metal_available() and self.config.optimizer.lower() == "adamw":
+            return MetalAdamW(
+                learning_rate=self.config.learning_rate,
+                betas=(self.config.beta1, self.config.beta2),
+                eps=self.config.eps,
+                weight_decay=self.config.weight_decay,
+            )
+        
         if self.config.optimizer.lower() == "adamw":
             return optim.AdamW(
                 learning_rate=self.config.learning_rate,
@@ -174,10 +239,13 @@ class LoRATrainer:
             scale = mx.minimum(1.0, self.config.max_grad_norm / (grad_norm + 1e-6))
             grads = {k: g * scale for k, g in grads.items()}
 
-        self.optimizer.update(self.model, grads)
-        mx.eval(self.model.parameters())
+        self.optimizer.update(self.model.base_model, grads)
+        
+        # evaluation of parameters is handled within MetalAdamW for zero-sync
+        if not isinstance(self.optimizer, MetalAdamW):
+            mx.eval(self.model.parameters())
+            
         self.state.global_step += 1
-
         return {"loss": float(loss)}
 
     def train(

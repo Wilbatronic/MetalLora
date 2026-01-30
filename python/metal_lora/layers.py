@@ -77,6 +77,7 @@ class LoRALinear(nn.Module):
         if freeze_base:
             self.W0 = mx.stop_gradient(self.W0)
 
+        self._best_config = None
         logger.debug(f"LoRALinear: {in_features}→{out_features}, rank={rank}")
 
     def __call__(self, x: mx.array) -> mx.array:
@@ -91,6 +92,7 @@ class LoRALinear(nn.Module):
         out = lora_forward(
             x=x, W0=self.W0, A=self.A, B=self.B,
             alpha=self.alpha, dropout=self.dropout, training=self.training,
+            kernel_kwargs=self._best_config,
         )
 
         if self.bias is not None:
@@ -154,6 +156,39 @@ class LoRALinear(nn.Module):
         if self.bias is not None:
             count += self.bias.size
         return count
+
+    def tune(self, warmup: int = 5, iters: int = 20):
+        """Find the best Metal kernel configuration for this layer."""
+        if not is_metal_available():
+            return
+
+        import time
+        x = mx.random.normal((1, 128, self.in_features))
+        configs = [
+            {"use_simd": False},
+            {"use_simd": True},
+        ]
+        
+        best_time = float('inf')
+        for config in configs:
+            # Warmup
+            for _ in range(warmup):
+                out = self.__call__(x)
+                mx.eval(out)
+            
+            # Benchmark
+            start = time.perf_counter()
+            for _ in range(iters):
+                out = self.__call__(x)
+                mx.eval(out)
+            end = time.perf_counter()
+            
+            avg_time = (end - start) / iters
+            if avg_time < best_time:
+                best_time = avg_time
+                self._best_config = config
+        
+        logger.info(f"Tuned {self.in_features}x{self.out_features}: {self._best_config}")
 
 
 class LoRAEmbedding(nn.Module):

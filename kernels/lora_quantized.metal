@@ -47,11 +47,20 @@ kernel void qlora_forward_int4(
     const uint seq_idx = tgid.y;
     const uint d = tgid.x * 256 + lid;
     
-    if (batch_idx >= batch_size || seq_idx >= seq_len || d >= D) return;
+    if (batch_idx >= batch_size || seq_idx >= seq_len) return;
     
     const float scale = alpha / float(R);
     const uint x_offset = (batch_idx * seq_len + seq_idx) * K;
     
+    // Cache x in threadgroup memory
+    threadgroup half tg_x[4096];
+    for (uint k = lid; k < K; k += 256) {
+        tg_x[k] = x[x_offset + k];
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    if (d >= D) return;
+
     float w_scale = W0_scales[d];
     float w_zero = W0_zeros[d];
     uint K_packed = K / 2;
@@ -64,15 +73,18 @@ kernel void qlora_forward_int4(
         float w0 = dequant_int4(packed, false, w_scale, w_zero);
         float w1 = dequant_int4(packed, true, w_scale, w_zero);
         
-        h += w0 * float(x[x_offset + k]);
-        if (k + 1 < K) h += w1 * float(x[x_offset + k + 1]);
+        h += w0 * float(tg_x[k]);
+        if (k + 1 < K) h += w1 * float(tg_x[k + 1]);
     }
     
+    // LoRA contribution (vectorized)
     float lora = 0.0f;
     for (uint r = 0; r < R; ++r) {
         float ax = 0.0f;
-        for (uint k = 0; k < K; ++k) {
-            ax += float(A[r * K + k]) * float(x[x_offset + k]);
+        for (uint k = 0; k < K; k += 4) {
+            half4 a_vec = half4(A[r * K + k], A[r * K + k + 1], A[r * K + k + 2], A[r * K + k + 3]);
+            half4 x_vec = half4(tg_x[k], tg_x[k+1], tg_x[k+2], tg_x[k+3]);
+            ax += float(dot(a_vec, x_vec));
         }
         lora += float(B[d * R + r]) * ax;
     }
@@ -103,12 +115,21 @@ kernel void qlora_forward_nf4(
     const uint seq_idx = tgid.y;
     const uint d = tgid.x * 256 + lid;
     
-    if (batch_idx >= batch_size || seq_idx >= seq_len || d >= D) return;
+    if (batch_idx >= batch_size || seq_idx >= seq_len) return;
     
     const float lora_scale = alpha / float(R);
     const uint x_offset = (batch_idx * seq_len + seq_idx) * K;
     const uint blocks_per_row = (K + block_size - 1) / block_size;
     
+    // Cache x in threadgroup memory
+    threadgroup half tg_x[4096];
+    for (uint k = lid; k < K; k += 256) {
+        tg_x[k] = x[x_offset + k];
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    if (d >= D) return;
+
     float h = 0.0f;
     for (uint block = 0; block < blocks_per_row; ++block) {
         float absmax = W0_absmax[d * blocks_per_row + block];
@@ -122,16 +143,19 @@ kernel void qlora_forward_nf4(
             float w0 = dequant_nf4(packed, false, absmax);
             float w1 = (k + 1 < K) ? dequant_nf4(packed, true, absmax) : 0.0f;
             
-            h += w0 * float(x[x_offset + k]);
-            if (k + 1 < K) h += w1 * float(x[x_offset + k + 1]);
+            h += w0 * float(tg_x[k]);
+            if (k + 1 < K) h += w1 * float(tg_x[k + 1]);
         }
     }
     
+    // LoRA contribution (vectorized)
     float lora = 0.0f;
     for (uint r = 0; r < R; ++r) {
         float ax = 0.0f;
-        for (uint k = 0; k < K; ++k) {
-            ax += float(A[r * K + k]) * float(x[x_offset + k]);
+        for (uint k = 0; k < K; k += 4) {
+            half4 a_vec = half4(A[r * K + k], A[r * K + k + 1], A[r * K + k + 2], A[r * K + k + 3]);
+            half4 x_vec = half4(tg_x[k], tg_x[k+1], tg_x[k+2], tg_x[k+3]);
+            ax += float(dot(a_vec, x_vec));
         }
         lora += float(B[d * R + r]) * ax;
     }

@@ -38,6 +38,7 @@ def lora_forward(
     dropout: float = 0.0,
     training: bool = False,
     use_metal: bool = True,
+    kernel_kwargs: dict | None = None,
 ) -> Array:
     """LoRA forward: h = W0 @ x + (alpha/rank) * B @ A @ x
 
@@ -75,7 +76,8 @@ def lora_forward(
     # Try Metal kernel path (inference only)
     if use_metal and is_metal_available() and not training:
         try:
-            return lora_forward_metal(x=x, w0=W0, a=A, b=B, alpha=alpha)
+            kwargs = kernel_kwargs or {}
+            return lora_forward_metal(x=x, w0=W0, a=A, b=B, alpha=alpha, **kwargs)
         except Exception:
             pass  # Fall back to MLX
 
@@ -132,7 +134,7 @@ def lora_backward(
         except Exception:
             pass
 
-    # Pure MLX batched computation
+    # Pure MLX batched computation (fallback)
     rank, _ = A.shape
     scale = alpha / rank
 
